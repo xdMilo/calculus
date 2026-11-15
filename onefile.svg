@@ -75,12 +75,30 @@
   function fix(u){ return (!CFG.origin && rootRel(u) && u.indexOf(BASE_PATH) !== 0) ? BASE + u.slice(1) : u; }
   function fixCss(v){ return typeof v === "string" ? v.replace(/url\(\s*(['"]?)(\/[^\/'")][^'")]*)\1\s*\)/g, function(m, q, u){ return "url(" + q + fix(u) + q + ")"; }) : v; }
   CFG.fix = fix;
+  function ownHtml(u){
+    try {
+      var x = new URL(u, location.href);
+      return x.origin === location.origin && x.pathname.indexOf(BASE_PATH) === 0 &&
+        x.pathname.indexOf(BASE_PATH + "scramjet/") !== 0 && /\.html?$/i.test(x.pathname);
+    } catch (e) { return false; }
+  }
   [["HTMLIFrameElement","src"],["HTMLImageElement","src"],["HTMLScriptElement","src"],["HTMLSourceElement","src"],
    ["HTMLMediaElement","src"],["HTMLEmbedElement","src"],["HTMLLinkElement","href"],["HTMLAnchorElement","href"],["HTMLVideoElement","poster"]]
   .forEach(function(p){
     var C = window[p[0]]; if (!C) return;
     var d = Object.getOwnPropertyDescriptor(C.prototype, p[1]); if (!d || !d.set) return;
-    Object.defineProperty(C.prototype, p[1], { configurable:true, enumerable:true, get:d.get, set:function(v){ d.set.call(this, fix(v)); } });
+    var isFrame = p[0] === "HTMLIFrameElement";
+    Object.defineProperty(C.prototype, p[1], { configurable:true, enumerable:true, get:d.get, set:function(v){
+      var el = this, u = fix(v);
+      // Our own .html (games) needs the service worker on jsDelivr; wait for it the first time.
+      if (isFrame && !window.__aetherSwOk && window.__aetherSwReady && ownHtml(u)) {
+        el.__aetherPending = u;
+        window.__aetherSwReady.then(function(){ if (el.__aetherPending === u) { el.__aetherPending = null; d.set.call(el, u); } });
+        return;
+      }
+      el.__aetherPending = null;
+      d.set.call(el, u);
+    } });
   });
   var nativeSetAttr = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function(n, v){
@@ -2531,6 +2549,7 @@ body.has-bookmarkbar #menu-btn { top: 146px; }
   
   
   
+  
    
 
 <script data-src="/js/onefile.js">/*<![CDATA[*/
@@ -2538,7 +2557,7 @@ body.has-bookmarkbar #menu-btn { top: 146px; }
 // sw.js, scram/, baremux/ and epoxy/ must sit in the same folder as onefile.svg.
 (function () {
   // ===== EDIT THIS: your Aether server's Wisp address, e.g. "wss://aether.example.com/" =====
-  var AETHER_WISP = "";
+  var AETHER_WISP = "wss://testgradesstudy.org/";
   // ===========================================================================================
 
   // Folder that onefile.svg was loaded from (works on jsDelivr, staticdelivr, GitHub Pages…)
@@ -2568,16 +2587,15 @@ body.has-bookmarkbar #menu-btn { top: 146px; }
     });
   }
 
-  async function init() {
-    if (!("serviceWorker" in navigator)) throw new Error("This browser doesn't support service workers.");
-    var wisp = getWisp();
-    if (!wisp) throw new Error("No Wisp server is set. Put your Wisp address in AETHER_WISP inside onefile.svg.");
-
-    await loadScript(P + "scram/scramjet.all.js");
-    await loadScript(P + "baremux/index.js");
-
+  function deleteDb(name) {
+    return new Promise(function (r) {
+      try { var q = indexedDB.deleteDatabase(name); q.onsuccess = q.onerror = function () { r(); }; q.onblocked = function () { setTimeout(r, 1500); }; }
+      catch (e) { r(); }
+    });
+  }
+  function makeController() {
     var ScramjetController = window.$scramjetLoadController().ScramjetController;
-    var sj = new ScramjetController({
+    return new ScramjetController({
       prefix: P + "scramjet/",
       files: {
         wasm: P + "scram/scramjet.wasm.wasm",
@@ -2585,11 +2603,49 @@ body.has-bookmarkbar #menu-btn { top: 146px; }
         sync: P + "scram/scramjet.sync.js",
       },
     });
-    await sj.init();
+  }
 
-    var reg = await navigator.serviceWorker.register(P + "sw.js", { scope: P, updateViaCache: "none" });
-    try { await reg.update(); } catch (e) {}
-    await navigator.serviceWorker.ready;
+  // 1) Scramjet sets up its database first (if the service worker opens it first it ends up empty).
+  var sjReady = (async function () {
+    await loadScript(P + "scram/scramjet.all.js");
+    var sj = makeController();
+    try {
+      await sj.init();
+    } catch (e) {
+      // Broken storage from an older build: drop the old worker + database and rebuild once.
+      console.warn("Aether Onefile: resetting Scramjet storage", e);
+      try {
+        var regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map(function (r) { return r.unregister(); }));
+      } catch (e2) {}
+      await deleteDb("$scramjet");
+      sj = makeController();
+      await sj.init();
+    }
+    return sj;
+  })();
+
+  // 2) Then the service worker (games need it too: it fixes jsDelivr's text/plain .html).
+  var swReady = sjReady.catch(function () {}).then(function () {
+    if (!("serviceWorker" in navigator)) throw new Error("This browser doesn't support service workers.");
+    return navigator.serviceWorker.register(P + "sw.js", { scope: P, updateViaCache: "none" });
+  }).then(function (reg) {
+    try { reg.update(); } catch (e) {}
+    return navigator.serviceWorker.ready;
+  });
+  // Frames that load our own .html wait for this (max 8 s) — see the SVG shim.
+  window.__aetherSwReady = Promise.race([
+    swReady.catch(function (e) { console.error("Aether Onefile: service worker", e); }),
+    new Promise(function (r) { setTimeout(r, 8000); }),
+  ]).then(function () { window.__aetherSwOk = true; });
+
+  // 3) Then the network transport through your Wisp server.
+  async function init() {
+    var sj = await sjReady;
+    await swReady;
+    var wisp = getWisp();
+    if (!wisp) throw new Error("No Wisp server is set. Put your Wisp address in AETHER_WISP inside onefile.svg.");
+    await loadScript(P + "baremux/index.js");
 
     var conn = new window.BareMux.BareMuxConnection(P + "baremux/worker.js");
     await conn.setTransport(P + "epoxy/index.mjs", [{ wisp: wisp }]);
@@ -4310,6 +4366,229 @@ function buildAccountPage() {
 }
 
 /*]]>*/</script>
+<script data-src="/js/onefile-ai.js">/*<![CDATA[*/
+// Aether Onefile AI: there is no Aether server here, so /api/ai/* is answered in the browser.
+// It talks straight to the AI provider using the person's own key (set in AI settings).
+// Keys never leave the browser except to the provider they belong to.
+(function () {
+  var NO_KEY_MSG = "Aether Onefile has no built-in AI key. Add your own free key (Groq or Google Gemini) in AI settings.";
+
+  var OPENAI_STYLE = {
+    groq: "https://api.groq.com/openai/v1",
+    openrouter: "https://openrouter.ai/api/v1",
+    openai: "https://api.openai.com/v1",
+    gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
+  };
+  // Preferred models, best first. If none exist any more, the first chat model the provider lists is used.
+  var PREFER = {
+    groq: ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "meta-llama/llama-4-maverick-17b-128e-instruct", "meta-llama/llama-4-scout-17b-16e-instruct", "qwen/qwen3-32b"],
+    groq_vision: ["meta-llama/llama-4-scout-17b-16e-instruct", "meta-llama/llama-4-maverick-17b-128e-instruct"],
+    openai: ["gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini"],
+    anthropic: ["haiku", "sonnet"],
+  };
+  var STYLE = {
+    short: "Keep answers short: a few sentences unless more is truly needed.",
+    normal: "Give clear, helpful answers of normal length.",
+    detailed: "Give detailed, thorough answers with examples where useful.",
+  };
+
+  function headerMap(h) {
+    var out = {};
+    if (!h) return out;
+    if (typeof Headers !== "undefined" && h instanceof Headers) { h.forEach(function (v, k) { out[k.toLowerCase()] = v; }); return out; }
+    Object.keys(h).forEach(function (k) { out[k.toLowerCase()] = h[k]; });
+    return out;
+  }
+  function json(status, body) {
+    return new Response(JSON.stringify(body), { status: status, headers: { "Content-Type": "application/json" } });
+  }
+  async function errorText(r) {
+    var t = "";
+    try { t = await r.text(); var j = JSON.parse(t); t = (j.error && (j.error.message || j.error)) || j.message || t; } catch (e) {}
+    if (r.status === 401 || r.status === 403) return "That key was rejected by the provider. Check it in AI settings.";
+    if (r.status === 429) return "The provider's rate limit was hit. Wait a bit and try again.";
+    return "The AI provider answered with an error (" + r.status + "): " + String(t).slice(0, 200);
+  }
+
+  function hasImages(messages) { return messages.some(function (m) { return m.images && m.images.length; }); }
+
+  // ---------- model choice ----------
+  var modelCache = {};
+  async function pickModel(provider, key, wanted, vision) {
+    if (wanted) return wanted;
+    if (provider === "openrouter") return "openrouter/auto";
+    if (provider === "gemini") return "gemini-flash-latest";
+    var cacheKey = provider + (vision ? ":v" : "");
+    if (modelCache[cacheKey]) return modelCache[cacheKey];
+    var ids = [];
+    try {
+      var r;
+      if (provider === "anthropic") {
+        r = await fetch("https://api.anthropic.com/v1/models?limit=100", { headers: anthropicHeaders(key) });
+      } else {
+        r = await fetch(OPENAI_STYLE[provider] + "/models", { headers: { Authorization: "Bearer " + key } });
+      }
+      if (r.ok) ids = ((await r.json()).data || []).map(function (m) { return m.id; });
+    } catch (e) {}
+    var prefs = PREFER[provider === "groq" && vision ? "groq_vision" : provider] || [];
+    var choice = null;
+    for (var i = 0; i < prefs.length && !choice; i++) {
+      choice = ids.find(function (id) { return provider === "anthropic" ? id.indexOf(prefs[i]) >= 0 : id === prefs[i]; }) || null;
+    }
+    if (!choice) choice = ids.find(function (id) { return !/whisper|tts|guard|embed|audio|image|dall|moderation|transcribe|realtime|search/i.test(id); }) || prefs[0];
+    if (!choice) throw new Error("Couldn't find a model for that provider. Type one in the Model box in AI settings.");
+    modelCache[cacheKey] = choice;
+    return choice;
+  }
+
+  // ---------- requests ----------
+  function anthropicHeaders(key) {
+    return {
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+      "Content-Type": "application/json",
+    };
+  }
+  function systemPrompt(style) {
+    return "You are Aether AI, a friendly, helpful assistant inside the Aether website. " +
+      "Format answers with Markdown when it helps. " + (STYLE[style] || STYLE.normal);
+  }
+  function splitDataUrl(u) {
+    var m = /^data:([^;,]+);base64,(.*)$/.exec(String(u || ""));
+    return m ? { type: m[1], data: m[2] } : null;
+  }
+  function openAiMessages(messages, style) {
+    var out = [{ role: "system", content: systemPrompt(style) }];
+    messages.forEach(function (m) {
+      if (m.images && m.images.length && m.role === "user") {
+        var parts = [{ type: "text", text: m.content || "" }];
+        m.images.forEach(function (img) { parts.push({ type: "image_url", image_url: { url: img } }); });
+        out.push({ role: "user", content: parts });
+      } else {
+        out.push({ role: m.role === "assistant" ? "assistant" : "user", content: m.content || "" });
+      }
+    });
+    return out;
+  }
+  function anthropicMessages(messages) {
+    return messages.map(function (m) {
+      if (m.images && m.images.length && m.role === "user") {
+        var parts = [];
+        m.images.forEach(function (img) {
+          var d = splitDataUrl(img);
+          if (d) parts.push({ type: "image", source: { type: "base64", media_type: d.type, data: d.data } });
+        });
+        parts.push({ type: "text", text: m.content || " " });
+        return { role: "user", content: parts };
+      }
+      return { role: m.role === "assistant" ? "assistant" : "user", content: m.content || " " };
+    });
+  }
+
+  async function callProvider(k, messages, style, signal, maxTokens, stream) {
+    var vision = hasImages(messages);
+    var model = await pickModel(k.provider, k.key, k.model, vision);
+    if (k.provider === "anthropic") {
+      return fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: anthropicHeaders(k.key),
+        body: JSON.stringify({ model: model, max_tokens: maxTokens, system: systemPrompt(style), messages: anthropicMessages(messages), stream: stream }),
+        signal: signal,
+      });
+    }
+    var base = OPENAI_STYLE[k.provider];
+    if (!base) throw new Error("Unknown AI provider.");
+    var headers = { Authorization: "Bearer " + k.key, "Content-Type": "application/json" };
+    if (k.provider === "openrouter") { headers["HTTP-Referer"] = location.origin; headers["X-Title"] = "Aether Onefile"; }
+    var body = { model: model, messages: openAiMessages(messages, style), stream: stream };
+    body[k.provider === "openai" ? "max_completion_tokens" : "max_tokens"] = maxTokens;
+    return fetch(base + "/chat/completions", { method: "POST", headers: headers, body: JSON.stringify(body), signal: signal });
+  }
+
+  // Turn the provider's event stream into plain text, which is what ai.js reads.
+  function toTextStream(res, provider) {
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var encoder = new TextEncoder();
+    var buf = "";
+    return new ReadableStream({
+      async pull(ctrl) {
+        for (;;) {
+          var r = await reader.read();
+          if (r.done) { ctrl.close(); return; }
+          buf += decoder.decode(r.value, { stream: true });
+          var lines = buf.split("\n");
+          buf = lines.pop();
+          var text = "";
+          lines.forEach(function (line) {
+            line = line.trim();
+            if (line.indexOf("data:") !== 0) return;
+            var data = line.slice(5).trim();
+            if (!data || data === "[DONE]") return;
+            try {
+              var j = JSON.parse(data);
+              if (provider === "anthropic") {
+                if (j.type === "content_block_delta" && j.delta && j.delta.text) text += j.delta.text;
+                if (j.type === "error") text += "\n\n[" + ((j.error && j.error.message) || "error") + "]";
+              } else {
+                var c = j.choices && j.choices[0];
+                if (c && c.delta && typeof c.delta.content === "string") text += c.delta.content;
+                if (j.error) text += "\n\n[" + (j.error.message || "error") + "]";
+              }
+            } catch (e) {}
+          });
+          if (text) { ctrl.enqueue(encoder.encode(text)); return; }
+        }
+      },
+      cancel() { try { reader.cancel(); } catch (e) {} },
+    });
+  }
+
+  function keyFrom(init) {
+    var h = headerMap(init && init.headers);
+    if (!h["x-ai-key"] || !h["x-ai-provider"]) return null;
+    return { key: h["x-ai-key"], provider: h["x-ai-provider"], model: h["x-ai-model"] || "", style: h["x-ai-style"] || "normal" };
+  }
+
+  async function handle(path, init) {
+    if (path === "/api/ai/status") return json(200, { onefile: true });
+    var k = keyFrom(init);
+    if (path === "/api/ai/test") {
+      if (!k) return json(400, { error: "Paste your key first." });
+      try {
+        var t = await callProvider(k, [{ role: "user", content: "Reply with OK." }], "short", undefined, 16, false);
+        if (!t.ok) return json(400, { error: await errorText(t) });
+        return json(200, { ok: true });
+      } catch (e) { return json(400, { error: e.message || "That key didn't work." }); }
+    }
+    if (path === "/api/ai/chat") {
+      if (!k) return json(503, { error: NO_KEY_MSG });
+      var body = {};
+      try { body = JSON.parse((init && init.body) || "{}"); } catch (e) {}
+      var messages = Array.isArray(body.messages) ? body.messages : [];
+      var style = headerMap(init.headers)["x-ai-style"] || "normal";
+      var res;
+      try { res = await callProvider(k, messages, style, init.signal, 2048, true); }
+      catch (e) {
+        if (e && e.name === "AbortError") throw e;
+        return json(502, { error: e.message || "Couldn't reach the AI provider." });
+      }
+      if (!res.ok) return json(res.status === 429 ? 429 : 502, { error: await errorText(res) });
+      return new Response(toTextStream(res, k.provider), { status: 200, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    }
+    return json(404, { error: "Not available in Aether Onefile." });
+  }
+
+  var prevFetch = window.fetch;
+  window.fetch = function (input, init) {
+    var u = typeof input === "string" ? input : (input instanceof URL ? input.href : null);
+    if (u && u.indexOf("/api/ai/") === 0) return handle(u.split(/[?#]/)[0], init || {});
+    return prevFetch.apply(this, arguments);
+  };
+})();
+
+/*]]>*/</script>
 <script data-src="/ai/ai.js">/*<![CDATA[*/
 const AI_CHATS_KEY = "aether-ai-chats";
 const AI_OLD_KEY = "aether-ai-chat";
@@ -5622,539 +5901,38 @@ function buildAiPage() {
 
 /*]]>*/</script>
 <script data-src="/chat/chat.js">/*<![CDATA[*/
-const CHAT_BADGES = {
-  owner: ["crown", "Owner"],
-  admin: ["shield-halved", "Admin"],
-  developer: ["code", "Developer"],
-  early: ["seedling", "Early user"],
-  veteran: ["medal", "Veteran"],
-  bughunter: ["bug", "Bug hunter"],
-  musiclover: ["headphones", "Music lover"],
-};
-
-const chat = { es: null, me: null, muted: null, ui: null, ids: new Set(), sending: false, watch: null };
-
+// Aether Onefile: chat needs an Aether account and the Aether server, so it isn't available here.
 function chatEl(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
   if (text !== undefined) e.textContent = text;
   return e;
 }
-
 function chatIcon(name) {
   const i = document.createElement("i");
   i.className = `fa-solid fa-${name}`;
   return i;
 }
-
-async function chatPost(path, body) {
-  const r = await fetch(`/api/chat/${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body || {}),
-    credentials: "same-origin",
-  });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || "Something went wrong.");
-  return data;
-}
-
-function chatTime(t) {
-  const d = new Date(t);
-  const today = new Date().toDateString() === d.toDateString();
-  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  return today ? time : `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
-}
-
-const CHAT_TOKEN_RE = /https?:\/\/[^\s<>()]+[^\s<>().,!?;:'"]|(^|[^\w@])@([A-Za-z0-9_.-]{1,32})/g;
-
-function chatMentions(text) {
-  const out = new Set();
-  for (const m of text.matchAll(CHAT_TOKEN_RE)) if (m[2]) out.add(m[2].replace(/[.-]+$/, "").toLowerCase());
-  return out;
-}
-
-function chatLinkify(text, parent) {
-  let last = 0;
-  for (const m of text.matchAll(CHAT_TOKEN_RE)) {
-    let start = m.index;
-    let token = m[0];
-    if (m[2] !== undefined) {
-      start += m[1].length;
-      token = `@${m[2].replace(/[.-]+$/, "")}`;
-    }
-    if (start > last) parent.appendChild(document.createTextNode(text.slice(last, start)));
-    if (m[2] !== undefined) {
-      const name = token.slice(1);
-      const mine = chat.me && name.toLowerCase() === chat.me.username.toLowerCase();
-      const span = chatEl("span", `chat-mention${mine ? " me" : ""}`, token);
-      span.onclick = (e) => chatOpenProfile(name, e.currentTarget);
-      parent.appendChild(span);
-    } else {
-      const a = chatEl("a", "", token);
-      a.href = "#";
-      a.onclick = (e) => {
-        e.preventDefault();
-        if (typeof createTab === "function") createTab(token);
-      };
-      parent.appendChild(a);
-    }
-    last = start + token.length;
-  }
-  if (last < text.length) parent.appendChild(document.createTextNode(text.slice(last)));
-}
-
-function chatClosePop() {
-  document.querySelectorAll(".chat-pop, .chat-modal-wrap").forEach((e) => e.remove());
-}
-
-document.addEventListener("mousedown", (e) => {
-  if (!e.target.closest(".chat-pop, .chat-name, .chat-mention, .chat-modal")) document.querySelectorAll(".chat-pop").forEach((p) => p.remove());
-});
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") chatClosePop();
-});
-
-function chatBadgeRow(badges) {
-  const row = chatEl("span", "chat-badges");
-  (badges || []).forEach((b) => {
-    const info = CHAT_BADGES[b];
-    if (!info) return;
-    const badge = chatEl("span", `chat-badge ${b}`);
-    badge.title = info[1];
-    badge.appendChild(chatIcon(info[0]));
-    row.appendChild(badge);
-  });
-  return row;
-}
-
-async function chatOpenProfile(username, anchor) {
-  chatClosePop();
-  const root = chat.ui && chat.ui.root;
-  if (!root) return;
-  const pop = chatEl("div", "chat-pop");
-  pop.appendChild(chatEl("div", "chat-pop-loading", "Loading..."));
-  root.appendChild(pop);
-  const a = anchor.getBoundingClientRect();
-  const r = root.getBoundingClientRect();
-  pop.style.left = `${Math.max(8, Math.min(a.left - r.left, r.width - 288))}px`;
-  pop.style.top = `${a.bottom - r.top + 6}px`;
-  try {
-    const res = await fetch(`/api/chat/profile/${encodeURIComponent(username)}`, { credentials: "same-origin" });
-    const d = await res.json();
-    if (!res.ok) throw new Error(d.error || "Couldn't load that profile.");
-    const p = d.profile;
-    pop.replaceChildren();
-    const head = chatEl("div", "chat-pop-head");
-    const av = chatEl("div", "chat-avatar big", p.username.slice(0, 1).toUpperCase());
-    av.style.setProperty("--hue", String([...p.username.toLowerCase()].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7)));
-    const names = chatEl("div");
-    names.appendChild(chatEl("div", `chat-name ${p.role || ""}`, p.username));
-    names.appendChild(chatBadgeRow(p.badges));
-    head.append(av, names);
-    pop.appendChild(head);
-    if (p.created) pop.appendChild(chatEl("div", "chat-pop-sub", `Joined ${new Date(p.created).toLocaleDateString([], { month: "long", day: "numeric", year: "numeric" })}`));
-    const mine = chat.me && p.username.toLowerCase() === chat.me.username.toLowerCase();
-    if (!mine) {
-      const actions = chatEl("div", "chat-pop-actions");
-      const mention = chatEl("button", "chat-pop-btn");
-      mention.append(chatIcon("at"), document.createTextNode(" Mention"));
-      mention.onclick = () => {
-        chatClosePop();
-        const input = chat.ui && chat.ui.input;
-        if (!input || input.disabled) return;
-        input.value = `${input.value.replace(/\s*$/, input.value.trim() ? " " : "")}@${p.username} `;
-        chatGrow();
-        input.focus();
-      };
-      const report = chatEl("button", "chat-pop-btn danger");
-      report.append(chatIcon("flag"), document.createTextNode(" Report"));
-      report.onclick = () => chatReport({ type: "user", username: p.username });
-      actions.append(mention, report);
-      pop.appendChild(actions);
-    }
-  } catch (err) {
-    pop.replaceChildren(chatEl("div", "chat-pop-loading", err.message));
-  }
-}
-
-function chatReport(target) {
-  chatClosePop();
-  const root = chat.ui && chat.ui.root;
-  if (!root) return;
-  const wrap = chatEl("div", "chat-modal-wrap");
-  const modal = chatEl("div", "chat-modal");
-  const title = target.type === "user" ? `Report ${target.username}` : `Report this message from ${target.username}`;
-  modal.appendChild(chatEl("div", "chat-modal-title", title));
-  if (target.text) modal.appendChild(chatEl("div", "chat-modal-quote", target.text));
-  const reasons = ["Hate speech or slurs", "Bullying or harassment", "Spam", "Inappropriate content", "Other"];
-  const pick = chatEl("div", "chat-modal-reasons");
-  let chosen = "";
-  reasons.forEach((r) => {
-    const b = chatEl("button", "chat-reason", r);
-    b.type = "button";
-    b.onclick = () => {
-      chosen = r;
-      pick.querySelectorAll(".chat-reason").forEach((x) => x.classList.toggle("on", x === b));
-      send.disabled = false;
-    };
-    pick.appendChild(b);
-  });
-  const details = document.createElement("textarea");
-  details.className = "chat-modal-input";
-  details.placeholder = "Anything else the moderators should know? (optional)";
-  details.maxLength = 250;
-  const status = chatEl("div", "chat-status");
-  const row = chatEl("div", "chat-modal-actions");
-  const cancel = chatEl("button", "chat-pop-btn", "Cancel");
-  cancel.onclick = () => wrap.remove();
-  const send = chatEl("button", "chat-pop-btn danger");
-  send.append(chatIcon("flag"), document.createTextNode(" Send report"));
-  send.disabled = true;
-  send.onclick = async () => {
-    send.disabled = true;
-    try {
-      const reason = details.value.trim() ? `${chosen}: ${details.value.trim()}` : chosen;
-      const d = await chatPost("report", { type: target.type, id: target.id, username: target.username, reason });
-      wrap.remove();
-      chatStatus(d.already ? "You already reported that. The moderators will look at it." : "Thanks, your report was sent to the moderators.", "ok");
-    } catch (err) {
-      status.textContent = err.message;
-      status.className = "chat-status error";
-      send.disabled = false;
-    }
-  };
-  row.append(cancel, send);
-  modal.append(pick, details, status, row);
-  wrap.appendChild(modal);
-  wrap.addEventListener("mousedown", (e) => {
-    if (e.target === wrap) wrap.remove();
-  });
-  root.appendChild(wrap);
-}
-
-function chatStatus(text, kind) {
-  const ui = chat.ui;
-  if (!ui) return;
-  ui.status.textContent = text || "";
-  ui.status.className = `chat-status ${kind || ""}`;
-}
-
-function chatCanModerate() {
-  return Boolean(chat.me && chat.me.mod);
-}
-
-function chatMessageNode(m) {
-  const row = chatEl("div", "chat-msg");
-  row.dataset.id = m.id;
-  const mine = chat.me && m.user.toLowerCase() === chat.me.username.toLowerCase();
-  if (mine) row.classList.add("mine");
-  const avatar = chatEl("div", "chat-avatar", m.user.slice(0, 1).toUpperCase());
-  avatar.style.setProperty("--hue", String([...m.user.toLowerCase()].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7)));
-  const body = chatEl("div", "chat-body");
-  const head = chatEl("div", "chat-head");
-  const name = chatEl("span", `chat-name ${m.role || ""}`, m.user);
-  name.onclick = (e) => chatOpenProfile(m.user, e.currentTarget);
-  avatar.onclick = (e) => chatOpenProfile(m.user, name);
-  head.append(name, chatBadgeRow(m.badges));
-  if (!mine && chat.me && chatMentions(m.text).has(chat.me.username.toLowerCase())) row.classList.add("mention-me");
-  head.appendChild(chatEl("span", "chat-time", chatTime(m.at)));
-  const text = chatEl("div", "chat-text");
-  chatLinkify(m.text, text);
-  body.append(head, text);
-
-  const tools = chatEl("div", "chat-tools");
-  if (mine || chatCanModerate()) {
-    const del = chatEl("button", "chat-tool");
-    del.title = "Delete message";
-    del.appendChild(chatIcon("trash"));
-    del.onclick = () => chatPost("delete", { id: m.id }).catch((err) => chatStatus(err.message, "error"));
-    tools.appendChild(del);
-  }
-  if (!mine) {
-    const rep = chatEl("button", "chat-tool");
-    rep.title = "Report message";
-    rep.appendChild(chatIcon("flag"));
-    rep.onclick = () => chatReport({ type: "message", id: m.id, username: m.user, text: m.text });
-    tools.appendChild(rep);
-  }
-  if (!mine && chatCanModerate() && m.role !== "owner") {
-    const mute = chatEl("button", "chat-tool");
-    mute.title = `Mute ${m.user} for 1 hour`;
-    mute.appendChild(chatIcon("volume-xmark"));
-    mute.onclick = () =>
-      chatPost("mute", { username: m.user, minutes: 60, reason: "Muted from chat" })
-        .then(() => chatStatus(`${m.user} is muted for 1 hour. Change it in the dashboard's Chat tab.`, "ok"))
-        .catch((err) => chatStatus(err.message, "error"));
-    tools.appendChild(mute);
-  }
-  row.append(avatar, body, tools);
-  return row;
-}
-
-function chatNearBottom() {
-  const list = chat.ui && chat.ui.list;
-  return !list || list.scrollHeight - list.scrollTop - list.clientHeight < 120;
-}
-
-function chatScroll(force) {
-  const list = chat.ui && chat.ui.list;
-  if (list && (force || chatNearBottom())) list.scrollTop = list.scrollHeight;
-}
-
-function chatAdd(m, force) {
-  const ui = chat.ui;
-  if (!ui || chat.ids.has(m.id)) return;
-  chat.ids.add(m.id);
-  const stick = chatNearBottom();
-  const empty = ui.list.querySelector(".chat-empty");
-  if (empty) empty.remove();
-  ui.list.appendChild(chatMessageNode(m));
-  chatScroll(force || stick);
-}
-
-function chatEmpty() {
-  const box = chatEl("div", "chat-empty");
-  box.appendChild(chatEl("div", "chat-empty-icon")).appendChild(chatIcon("comments"));
-  box.appendChild(chatEl("div", "chat-empty-title", "No messages yet"));
-  box.appendChild(chatEl("div", "chat-empty-sub", "Say hi to get things going."));
-  return box;
-}
-
-function chatSyncMuted() {
-  const ui = chat.ui;
-  if (!ui) return;
-  const m = chat.muted;
-  ui.input.disabled = Boolean(m);
-  ui.send.disabled = Boolean(m) || !ui.input.value.trim() || chat.sending;
-  if (m) {
-    const until = m.until ? ` until ${new Date(m.until).toLocaleString()}` : "";
-    ui.input.placeholder = `You're muted${until}.`;
-    chatStatus(`You're muted${until}.${m.reason ? ` Reason: ${m.reason}` : ""}`, "error");
-  } else {
-    ui.input.placeholder = "Message the chat...";
-  }
-}
-
-function chatClose() {
-  if (chat.es) chat.es.close();
-  chat.es = null;
-  clearInterval(chat.watch);
-  chat.watch = null;
-}
-
-function chatConnect() {
-  chatClose();
-  const es = new EventSource("/api/chat/stream", { withCredentials: true });
-  chat.es = es;
-  es.addEventListener("hello", (e) => {
-    const d = JSON.parse(e.data);
-    chat.me = d.me;
-    chat.muted = d.muted;
-    chat.ids.clear();
-    const ui = chat.ui;
-    if (!ui) return;
-    ui.list.replaceChildren();
-    if (!d.messages.length) ui.list.appendChild(chatEmpty());
-    d.messages.forEach((m) => chatAdd(m, true));
-    ui.online.textContent = `${d.online} online`;
-    chatStatus("");
-    chatMarkSeen();
-    chatSyncMuted();
-    chatScroll(true);
-  });
-  es.addEventListener("message", (e) => {
-    const m = JSON.parse(e.data);
-    chatAdd(m);
-    if (chat.me && m.user.toLowerCase() !== chat.me.username.toLowerCase() && chatMentions(m.text).has(chat.me.username.toLowerCase())) chatMarkSeen();
-  });
-  es.addEventListener("delete", (e) => {
-    const { id } = JSON.parse(e.data);
-    const node = chat.ui && chat.ui.list.querySelector(`[data-id="${CSS.escape(id)}"]`);
-    if (node) node.remove();
-    chat.ids.delete(id);
-    if (chat.ui && !chat.ui.list.children.length) chat.ui.list.appendChild(chatEmpty());
-  });
-  es.addEventListener("online", (e) => {
-    if (chat.ui) chat.ui.online.textContent = `${JSON.parse(e.data).count} online`;
-  });
-  es.addEventListener("muted", (e) => {
-    chat.muted = JSON.parse(e.data);
-    chatSyncMuted();
-  });
-  es.addEventListener("unmuted", () => {
-    chat.muted = null;
-    chatStatus("You can chat again.", "ok");
-    chatSyncMuted();
-  });
-  es.onerror = () => {
-    if (es.readyState === EventSource.CLOSED) {
-      chatStatus("Lost connection to the chat. Reconnecting...", "error");
-      setTimeout(() => {
-        if (chat.ui && chat.ui.root.isConnected && chat.es === es) chatConnect();
-      }, 3000);
-    } else {
-      chatStatus("Reconnecting...", "");
-    }
-  };
-  chat.watch = setInterval(() => {
-    if (!chat.ui || !chat.ui.root.isConnected) chatClose();
-  }, 3000);
-}
-
-async function chatSend() {
-  const ui = chat.ui;
-  const text = ui.input.value.trim();
-  if (!text || chat.sending || chat.muted) return;
-  chat.sending = true;
-  chatSyncMuted();
-  try {
-    const d = await chatPost("send", { text });
-    ui.input.value = "";
-    chatGrow();
-    chatStatus("");
-    if (d.message) chatAdd(d.message, true);
-  } catch (err) {
-    chatStatus(err.message, "error");
-  } finally {
-    chat.sending = false;
-    chatSyncMuted();
-    ui.input.focus();
-  }
-}
-
-function chatGrow() {
-  const input = chat.ui && chat.ui.input;
-  if (!input) return;
-  input.style.height = "auto";
-  input.style.height = `${Math.min(input.scrollHeight, 140)}px`;
-  chat.ui.counter.textContent = input.value.length > 400 ? `${input.value.length}/500` : "";
-  chatSyncMuted();
-}
-
-function chatLoggedOut(root) {
-  const box = chatEl("div", "chat-gate");
-  box.appendChild(chatEl("div", "chat-empty-icon")).appendChild(chatIcon("lock"));
-  box.appendChild(chatEl("div", "chat-empty-title", "Log in to chat"));
-  box.appendChild(chatEl("div", "chat-empty-sub", "The chatroom is only open to people with an Aether account."));
-  const btn = chatEl("button", "chat-gate-btn");
-  btn.append(chatIcon("user"), document.createTextNode(" Log in or sign up"));
-  btn.onclick = () => document.getElementById("account-btn").click();
-  box.appendChild(btn);
-  root.appendChild(box);
-}
-
 function buildChatPage() {
-  chatClose();
   const root = chatEl("div", "chat-page");
   const top = chatEl("div", "chat-top");
   const title = chatEl("div", "chat-title");
   title.append(chatIcon("comments"), document.createTextNode(" Aether Chat"));
-  const online = chatEl("div", "chat-online", "");
-  top.append(title, online);
+  top.appendChild(title);
   root.appendChild(top);
-
   const shell = chatEl("div", "chat-shell");
+  const box = chatEl("div", "chat-gate");
+  box.appendChild(chatEl("div", "chat-empty-icon")).appendChild(chatIcon("lock"));
+  box.appendChild(chatEl("div", "chat-empty-title", "Chat isn't available in Aether Onefile"));
+  box.appendChild(chatEl("div", "chat-empty-sub", "The chatroom needs an Aether account. Use the main Aether site to log in and chat."));
+  const btn = chatEl("button", "chat-gate-btn");
+  btn.append(chatIcon("user"), document.createTextNode(" More info"));
+  btn.onclick = () => document.getElementById("account-btn").click();
+  box.appendChild(btn);
+  shell.appendChild(box);
   root.appendChild(shell);
-  shell.appendChild(chatEl("div", "chat-loading", "Loading chat..."));
-
-  fetch("/api/account/me", { credentials: "same-origin" })
-    .then((r) => r.json())
-    .then((d) => {
-      shell.replaceChildren();
-      if (!d || !d.user) {
-        chat.ui = null;
-        return chatLoggedOut(shell);
-      }
-      const list = chatEl("div", "chat-list");
-      const status = chatEl("div", "chat-status");
-      const form = chatEl("form", "chat-compose");
-      const input = document.createElement("textarea");
-      input.rows = 1;
-      input.maxLength = 500;
-      input.placeholder = "Message the chat...";
-      const counter = chatEl("span", "chat-counter");
-      const send = chatEl("button", "chat-send");
-      send.type = "submit";
-      send.title = "Send";
-      send.appendChild(chatIcon("paper-plane"));
-      form.append(input, counter, send);
-      const note = chatEl("div", "chat-note", "Be nice. Messages are saved and checked by moderators.");
-      shell.append(list, status, form, note);
-      chat.ui = { root, list, status, input, send, online, counter };
-      form.onsubmit = (e) => {
-        e.preventDefault();
-        chatSend();
-      };
-      input.addEventListener("input", chatGrow);
-      input.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
-          e.preventDefault();
-          chatSend();
-        }
-      });
-      chatSyncMuted();
-      chatConnect();
-      setTimeout(() => input.focus(), 0);
-    })
-    .catch(() => {
-      shell.replaceChildren(chatEl("div", "chat-loading", "Couldn't load the chat. Try again in a moment."));
-    });
   return root;
 }
-
-let chatSeenTimer = null;
-
-function chatMarkSeen() {
-  clearTimeout(chatSeenTimer);
-  chatSeenTimer = setTimeout(() => {
-    fetch("/api/chat/seen", { method: "POST", credentials: "same-origin" }).catch(() => {});
-    chatSetDot(0);
-  }, 400);
-}
-
-function chatOnPage() {
-  return Boolean(chat.ui && chat.ui.root.isConnected && chat.ui.root.offsetParent !== null);
-}
-
-function chatSetDot(count) {
-  const show = count > 0 && !chatOnPage();
-  const label = count > 9 ? "9+" : String(count);
-  const item = document.getElementById("chat-item");
-  if (item) {
-    let dot = item.querySelector(".chat-dot");
-    if (show && !dot) dot = item.appendChild(chatEl("span", "chat-dot"));
-    if (dot) {
-      if (show) dot.textContent = label;
-      else dot.remove();
-    }
-    item.title = show ? `${count} new mention${count === 1 ? "" : "s"}` : "";
-  }
-  const menu = document.getElementById("menu-btn");
-  if (menu) menu.classList.toggle("has-chat-dot", show);
-  if (typeof tabs !== "undefined" && Array.isArray(tabs)) {
-    tabs.forEach((t) => {
-      if (!t.tabBtn) return;
-      const on = show && t.url === "aether://chat";
-      t.tabBtn.classList.toggle("has-chat-dot", on);
-    });
-  }
-}
-
-async function chatPollUnread() {
-  try {
-    const r = await fetch("/api/chat/unread", { credentials: "same-origin" });
-    if (r.ok) {
-      const d = await r.json();
-      if (d.mentions && chatOnPage()) chatMarkSeen();
-      else chatSetDot(d.mentions || 0);
-    } else chatSetDot(0);
-  } catch {}
-}
-
-setInterval(chatPollUnread, 20000);
-if (document.readyState === "loading") window.addEventListener("DOMContentLoaded", () => setTimeout(chatPollUnread, 1500));
-else setTimeout(chatPollUnread, 1500);
 
 /*]]>*/</script>
 <script data-src="/js/snow.js">/*<![CDATA[*/
@@ -6536,8 +6314,17 @@ async function loadAetherFrame(iframe, url) {
     console.error("Aether: could not open", url, err);
     if (iframe.isConnected) {
       const message = document.createElement("div");
-      message.textContent = "The web proxy couldn't start: " + ((err && err.message) || err);
       message.style.padding = "24px";
+      message.style.lineHeight = "1.6";
+      const text = document.createElement("div");
+      text.textContent = "The web proxy couldn't start: " + ((err && err.message) || err);
+      const open = document.createElement("button");
+      open.className = "account-btn";
+      open.style.marginTop = "12px";
+      open.textContent = "Open in a new browser tab instead";
+      open.onclick = () => window.open(url, "_blank", "noopener");
+      message.appendChild(text);
+      message.appendChild(open);
       iframe.replaceWith(message);
     }
   }
