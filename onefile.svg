@@ -2650,19 +2650,73 @@ body.has-bookmarkbar #menu-btn { top: 146px; }
     var conn = new window.BareMux.BareMuxConnection(P + "baremux/worker.js");
     // Some CDNs (staticdelivr) serve .mjs with a non-JavaScript type, which browsers refuse to import.
     // So the Epoxy module is shipped as epoxy/index.esm.js; if even that fails, import it from a data: URL.
-    try {
-      await conn.setTransport(P + "epoxy/index.esm.js", [{ wisp: wisp }]);
-    } catch (e) {
-      console.warn("Aether Onefile: loading Epoxy from a data URL", e);
-      var code = await (await fetch(P + "epoxy/index.esm.js")).text();
-      var dataUrl = "data:text/javascript;base64," + btoa(unescape(encodeURIComponent(code)));
-      await conn.setTransport(dataUrl, [{ wisp: wisp }]);
+    // The transport module is read with fetch (which ignores the CDN's content type) and imported
+    // from a data: URL, with small fixes applied to its code on the way.
+    async function loadText(files) {
+      for (var i = 0; i < files.length; i++) {
+        try {
+          var r = await fetch(P + files[i]);
+          var t = r.ok ? await r.text() : "";
+          if (t && !/^\s*</.test(t)) return t;
+        } catch (e) {}
+      }
+      return null;
+    }
+    function toDataUrl(code) {
+      var bytes = new TextEncoder().encode(code), bin = "";
+      for (var j = 0; j < bytes.length; j += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(j, j + 0x8000));
+      return "data:text/javascript;base64," + btoa(bin);
+    }
+
+    // 1) libcurl-transport (preferred). Epoxy's HTTP/2 client can't take large response headers,
+    //    which breaks sites like YouTube ("PROTOCOL_ERROR, Library"); curl handles them.
+    var transport = null;
+    var curl = await loadText(["libcurl/index.mjs"]);
+    if (curl) {
+      // BareMux hands headers over as a plain object; this transport loops over them as a list.
+      curl = curl
+        .replace("for (let [key, value] of headers) {", "for (let [key, value] of (headers && typeof headers[Symbol.iterator] === \"function\" ? headers : Object.entries(headers || {}))) {")
+        .replace("for (let [key, value] of requestHeaders) {", "for (let [key, value] of (requestHeaders && typeof requestHeaders[Symbol.iterator] === \"function\" ? requestHeaders : Object.entries(requestHeaders || {}))) {")
+        // ...and expects response headers back as an object, while libcurl gives a list of pairs.
+        .replace("headers: payload.raw_headers,", "headers: __aetherHeaderObj(payload.raw_headers),") +
+        "\nfunction __aetherHeaderObj(list) {\n" +
+        "  if (!Array.isArray(list)) return list || {};\n" +
+        "  var out = {};\n" +
+        "  list.forEach(function (p) { var k = String(p[0]).toLowerCase(), v = p[1];\n" +
+        "    if (out[k] === undefined) out[k] = v; else out[k] = [].concat(out[k], v); });\n" +
+        "  return out;\n}\n";
+      try {
+        await conn.setTransport(toDataUrl(curl), [{ wisp: wisp }]);
+        transport = "libcurl";
+      } catch (e) {
+        console.warn("Aether Onefile: libcurl transport failed, trying Epoxy", e);
+      }
+    }
+
+    // 2) Epoxy (fallback), with HTTP/1-only headers removed so its HTTP/2 client accepts them.
+    if (!transport) {
+      var code = await loadText(["epoxy/index.mjs", "epoxy/index.esm.js"]);
+      if (code === null) throw new Error("Couldn't load a proxy transport. Make sure the libcurl and epoxy folders are uploaded next to onefile.svg.");
+      var CALL = "this.client.fetch(remote.href, { method, body, headers, redirect: \"manual\" })";
+      if (code.indexOf(CALL) >= 0) {
+        code = code.replace(CALL, "this.client.fetch(remote.href, { method, body, headers: __aetherH2Safe(headers), redirect: \"manual\" })") +
+          "\nfunction __aetherH2Safe(h) {\n" +
+          "  var drop = { connection: 1, \"keep-alive\": 1, \"proxy-connection\": 1, \"transfer-encoding\": 1, upgrade: 1, host: 1 };\n" +
+          "  var out = {}; if (!h) return out;\n" +
+          "  var add = function (k, v) { var n = String(k).toLowerCase(); if (drop[n] || n.charAt(0) === \":\") return; if (n === \"te\" && String(v).toLowerCase() !== \"trailers\") return; out[k] = v; };\n" +
+          "  if (typeof h.forEach === \"function\" && !Array.isArray(h)) h.forEach(function (v, k) { add(k, v); });\n" +
+          "  else if (Array.isArray(h)) h.forEach(function (p) { add(p[0], p[1]); });\n" +
+          "  else Object.keys(h).forEach(function (k) { add(k, h[k]); });\n" +
+          "  return out;\n}\n";
+      }
+      await conn.setTransport(toDataUrl(code), [{ wisp: wisp }]);
+      transport = "epoxy";
     }
 
     window.scramjet = sj;
     window.aetherEncode = function (url) { return sj.encodeUrl(url); };
     window.aetherEngine = "scramjet-v1";
-    window.aetherTransport = "epoxy";
+    window.aetherTransport = transport;
     window.dispatchEvent(new Event("aether-ready"));
   }
 
