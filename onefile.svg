@@ -2650,13 +2650,25 @@ body.has-bookmarkbar #menu-btn { top: 146px; }
     var conn = new window.BareMux.BareMuxConnection(P + "baremux/worker.js");
     // Some CDNs (staticdelivr) serve .mjs with a non-JavaScript type, which browsers refuse to import.
     // So the Epoxy module is shipped as epoxy/index.esm.js; if even that fails, import it from a data: URL.
+    var opts = [{ wisp: wisp }];
     try {
-      await conn.setTransport(P + "epoxy/index.esm.js", [{ wisp: wisp }]);
+      await conn.setTransport(P + "epoxy/index.esm.js", opts);
     } catch (e) {
+      // index.esm.js missing or served with the wrong type: read the module's text ourselves
+      // (fetch doesn't care about the content type) and import it from a data: URL.
       console.warn("Aether Onefile: loading Epoxy from a data URL", e);
-      var code = await (await fetch(P + "epoxy/index.esm.js")).text();
-      var dataUrl = "data:text/javascript;base64," + btoa(unescape(encodeURIComponent(code)));
-      await conn.setTransport(dataUrl, [{ wisp: wisp }]);
+      var code = null, files = ["epoxy/index.esm.js", "epoxy/index.mjs"];
+      for (var i = 0; i < files.length && code === null; i++) {
+        try {
+          var r = await fetch(P + files[i], { cache: "no-store" });
+          var t = r.ok ? await r.text() : "";
+          if (t && !/^\s*</.test(t)) code = t;
+        } catch (e2) {}
+      }
+      if (code === null) throw new Error("Couldn't load the Epoxy transport (epoxy/index.mjs). Make sure the epoxy folder is uploaded next to onefile.svg.");
+      var bytes = new TextEncoder().encode(code), bin = "";
+      for (var j = 0; j < bytes.length; j += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(j, j + 0x8000));
+      await conn.setTransport("data:text/javascript;base64," + btoa(bin), opts);
     }
 
     window.scramjet = sj;
